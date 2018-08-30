@@ -1,0 +1,33 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: KMS Keys
+
+Resources:
+  KmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Custom key for SSM parameters 
+      Enabled: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-policy
+        Statement: 
+          - Sid: Allow root account access to key
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: "*"
+  KmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/secrets-key
+      TargetKeyId: !Ref KmsKey
+
+Outputs:
+  KmsKey:
+    Description: Secrets Key KMS Key Arn
+    Value: !Sub ${KmsKey.Arn}
+    Export:
+      Name: secrets-key

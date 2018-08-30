@@ -1,0 +1,807 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Todobackend Application
+
+Parameters:
+  ApplicationDesiredCount:
+    Type: Number
+    Description: Desired EC2 instance count
+  ApplicationImageId:
+    Type: String
+    Description: ECS Amazon Machine Image (AMI) ID
+  ApplicationImageTag:
+    Type: String
+    Description: Application Docker Image Tag
+    Default: latest
+  ApplicationSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Target subnets for EC2 instances
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Target VPC
+
+Resources:
+  LifecycleHook:
+    Type: AWS::AutoScaling::LifecycleHook
+    Properties:
+      RoleARN: !Sub ${LifecycleHookRole.Arn}
+      AutoScalingGroupName: !Ref ApplicationAutoscaling
+      DefaultResult: CONTINUE
+      HeartbeatTimeout: 900
+      LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+      NotificationTargetARN: !Ref LifecycleHookTopic
+  LifecycleHookRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: autoscaling.amazonaws.com
+      Policies:
+        - PolicyName: LifecycleHookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: PublishNotifications
+              Action:
+                - sns:Publish
+              Effect: Allow
+              Resource: !Ref LifecycleHookTopic
+  LifecycleHookTopic:
+    Type: AWS::SNS::Topic
+    Properties: {}
+  LifecycleHookSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Sub ${LifecycleHookFunction.Arn}
+      Protocol: lambda
+      TopicArn: !Ref LifecycleHookTopic
+  LifecycleHookPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LifecycleHookFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref LifecycleHookTopic
+  LifecycleFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+      Policies:
+        - PolicyName: LifecycleHookPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Publish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  Ref: LifecycleHookTopic
+              - Sid: CompleteLifecycleAction
+                Effect: Allow
+                Action:
+                  - autoscaling:CompleteLifecycleAction
+                Resource: !Sub arn:aws:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${ApplicationAutoscaling}
+              - Sid: ListContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:ListContainerInstances
+                Resource:
+                  Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: ManageContainerInstances
+                Effect: Allow
+                Action:
+                  - ecs:DescribeContainerInstances
+                  - ecs:UpdateContainerInstancesState
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster:
+                      Fn::Sub: arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ApplicationCluster}
+              - Sid: ManageLambdaLogs
+                Effect: Allow
+                Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+                Resource:
+                  Fn::Sub: ${LifecycleHookFunctionLogGroup.Arn}
+  LifecycleHookFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LifecycleHookFunctionLogGroup
+    Properties:
+      Role: !Sub ${LifecycleFunctionRole.Arn}
+      FunctionName: !Sub ${AWS::StackName}-lifecycleHooks
+      Description: !Sub ${AWS::StackName} Autoscaling Lifecycle Hook
+      Environment:
+        Variables:
+          ECS_CLUSTER: !Ref ApplicationCluster
+      Code:
+        ZipFile: |
+          import os, time
+          import json
+          import boto3
+          cluster = os.environ['ECS_CLUSTER']
+          # AWS clients
+          ecs = boto3.client('ecs')
+          sns = boto3.client('sns')
+          autoscaling = boto3.client('autoscaling')
+
+          def handler(event, context):
+            print("Received event %s" % event)
+            for r in event.get('Records'):
+              # Parse SNS message
+              message = json.loads(r['Sns']['Message'])
+              transition, hook = message['LifecycleTransition'], message['LifecycleHookName']
+              group, ec2_instance = message['AutoScalingGroupName'], message['EC2InstanceId']
+              if transition != 'autoscaling:EC2_INSTANCE_TERMINATING':
+                print("Ignoring lifecycle transition %s" % transition)
+                return
+              try:
+                # Get ECS container instance ARN
+                ecs_instance_arns = ecs.list_container_instances(
+                  cluster=cluster
+                )['containerInstanceArns']
+                ecs_instances = ecs.describe_container_instances(
+                  cluster=cluster,
+                  containerInstances=ecs_instance_arns
+                )['containerInstances']
+                # Find ECS container instance with same EC2 instance ID in lifecycle hook message
+                ecs_instance_arn = next((
+                  instance['containerInstanceArn'] for instance in ecs_instances
+                  if instance['ec2InstanceId'] == ec2_instance
+                ), None)
+                if ecs_instance_arn is None:
+                  raise ValueError('Could not locate ECS instance')
+                # Drain instance
+                ecs.update_container_instances_state(
+                  cluster=cluster,
+                  containerInstances=[ecs_instance_arn],
+                  status='DRAINING'
+                )
+                # Check task count on instance every 5 seconds
+                count = 1
+                while count > 0 and context.get_remaining_time_in_millis() > 10000:
+                  status = ecs.describe_container_instances(
+                    cluster=cluster,
+                    containerInstances=[ecs_instance_arn],
+                  )['containerInstances'][0]
+                  count = status['runningTasksCount']
+                  print("Sleeping...")
+                  time.sleep(5)
+                if count == 0:
+                  print("All tasks drained - sending CONTINUE signal")
+                  autoscaling.complete_lifecycle_action(
+                    LifecycleHookName=hook,
+                    AutoScalingGroupName=group,
+                    InstanceId=ec2_instance,
+                    LifecycleActionResult='CONTINUE'
+                  )
+                else:
+                  print("Function timed out - republishing SNS message")
+                  sns.publish(TopicArn=r['Sns']['TopicArn'], Message=r['Sns']['Message'])
+              except Exception as e:
+                print("A failure occurred with exception %s" % e)
+                autoscaling.complete_lifecycle_action(
+                  LifecycleHookName=hook,
+                  AutoScalingGroupName=group,
+                  InstanceId=ec2_instance,
+                  LifecycleActionResult='ABANDON'
+                )
+      Runtime: python3.6
+      MemorySize: 128
+      Timeout: 300
+      Handler: index.handler
+  LifecycleHookFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName:
+        Fn::Sub: /aws/lambda/${AWS::StackName}-lifecycleHooks
+      RetentionInDays: 7
+  Secrets:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !Sub ${SecretsManager.Arn}
+      SecretId: todobackend/credentials
+  SecretsManager:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - SecretsManagerLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-secretsManager
+      Description: !Sub ${AWS::StackName} Secrets Manager
+      Handler: index.handler
+      MemorySize: 128
+      Runtime: python3.6
+      Timeout: 300
+      Role: !Sub ${SecretsManagerRole.Arn}
+      Code:
+        ZipFile: |
+          import cfnresponse, json, sys, os
+          import boto3
+
+          client = boto3.client('secretsmanager')
+
+          def handler(event, context):
+            sys.stdout = sys.__stdout__
+            try:
+              print("Received event %s" % event)
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event['PhysicalResourceId'])
+                return
+              secret = client.get_secret_value(
+                SecretId=event['ResourceProperties']['SecretId'],
+              )
+              credentials = json.loads(secret['SecretString'])
+              # Suppress logging output to ensure credential values are kept secure
+              with open(os.devnull, "w") as devnull:
+                sys.stdout = devnull
+                cfnresponse.send(
+                  event,
+                  context,
+                  cfnresponse.SUCCESS,
+                  credentials, # This dictionary will be exposed to CloudFormation resources
+                  secret['VersionId'], # Physical ID of the custom resource
+                  noEcho=True
+                )
+            except Exception as e:
+              print("A failure occurred with exception %s" % e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+  SecretsManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: GetSecrets
+              Effect: Allow
+              Action:
+              - secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:todobackend/*
+            - Sid: DecryptSecrets
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource: !ImportValue secrets-key
+            - Sid: ManageLambdaLogs
+              Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: !Sub ${SecretsManagerLogGroup.Arn}
+  SecretsManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-secretsManager
+      RetentionInDays: 7
+  MigrateTask:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - ApplicationAutoscaling
+      - ApplicationDatabase
+    Properties:
+      ServiceToken: !Sub ${EcsTaskRunner.Arn}
+      Cluster: !Ref ApplicationCluster
+      TaskDefinition: !Ref MigrateTaskDefinition
+  MigrateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: todobackend-migrate
+      TaskRoleArn: !Sub ${ApplicationTaskRole.Arn}
+      ContainerDefinitions:
+        - Name: migrate
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/docker-in-aws/todobackend:${ApplicationImageTag}
+          MemoryReservation: 5
+          Cpu: 5
+          Environment:
+            - Name: DJANGO_SETTINGS_MODULE
+              Value: todobackend.settings_release
+            - Name: MYSQL_HOST
+              Value: !Sub ${ApplicationDatabase.Endpoint.Address}
+            - Name: MYSQL_USER
+              Value: todobackend
+            - Name: MYSQL_DATABASE
+              Value: todobackend
+            - Name: SECRETS
+              Value: todobackend/credentials
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Command:
+            - python3
+            - manage.py
+            - migrate
+            - --no-input
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /${AWS::StackName}/ecs/todobackend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: docker
+  EcsTaskRunner:
+    Type: AWS::Lambda::Function
+    DependsOn:
+    - EcsTaskRunnerLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-ecsTasks
+      Description: !Sub ${AWS::StackName} ECS Task Runner
+      Handler: index.handler
+      MemorySize: 128
+      Runtime: python3.6
+      Timeout: 300
+      Role: !Sub ${EcsTaskRunnerRole.Arn}
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+
+          client = boto3.client('ecs')
+
+          def handler(event, context):
+            try:
+              print("Received event %s" % event)
+              if event['RequestType'] == 'Delete':
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, event['PhysicalResourceId'])
+                return
+              tasks = client.run_task(
+                cluster=event['ResourceProperties']['Cluster'],
+                taskDefinition=event['ResourceProperties']['TaskDefinition'],
+                overrides=event['ResourceProperties'].get('Overrides',{}),
+                count=1,
+                startedBy=event['RequestId']
+              )
+              task = tasks['tasks'][0]['taskArn']
+              print("Started ECS task %s" % task)
+              waiter = client.get_waiter('tasks_stopped')
+              waiter.wait(
+                cluster=event['ResourceProperties']['Cluster'],
+                tasks=[task],
+              )
+              result = client.describe_tasks(
+                cluster=event['ResourceProperties']['Cluster'],
+                tasks=[task]
+              )
+              exitCode = result['tasks'][0]['containers'][0]['exitCode']
+              if exitCode > 0:
+                print("ECS task %s failed with exit code %s" % (task, exitCode))
+                cfnresponse.send(event, context, cfnresponse.FAILED, {}, task)
+              else:
+                print("ECS task %s completed successfully" % task)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, task)
+            except Exception as e:
+              print("A failure occurred with exception %s" % e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+  EcsTaskRunnerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: EcsTaskRunnerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: EcsTasks
+              Effect: Allow
+              Action:
+              - ecs:DescribeTasks
+              - ecs:ListTasks
+              - ecs:RunTask
+              Resource: "*"
+              Condition:
+                ArnEquals:
+                  ecs:cluster: !Sub ${ApplicationCluster.Arn}
+            - Sid: ManageLambdaLogs
+              Effect: Allow
+              Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              Resource: !Sub ${EcsTaskRunnerLogGroup.Arn}
+  EcsTaskRunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-ecsTasks
+      RetentionInDays: 7
+  ApplicationService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApplicationAutoscaling
+      - ApplicationLogGroup
+      - ApplicationLoadBalancerHttpListener
+      - MigrateTask
+    Properties:
+      TaskDefinition: !Ref ApplicationTaskDefinition
+      Cluster: !Ref ApplicationCluster
+      DesiredCount: !Ref ApplicationDesiredCount
+      LoadBalancers:
+        - ContainerName: todobackend
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ApplicationServiceTargetGroup
+      Role: !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.amazonaws.com/AWSServiceRoleForECS
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+  ApplicationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action:
+            - sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+            - Sid: GetSecrets
+              Effect: Allow
+              Action:
+              - secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:todobackend/*
+            - Sid: DecryptSecrets
+              Effect: Allow
+              Action:
+              - kms:Decrypt
+              Resource: !ImportValue secrets-key
+  ApplicationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: todobackend
+      TaskRoleArn: !Sub ${ApplicationTaskRole.Arn}
+      Volumes:
+        - Name: public
+          Host:
+            SourcePath: /data/public
+      ContainerDefinitions:
+        - Name: todobackend
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/docker-in-aws/todobackend:${ApplicationImageTag}
+          MemoryReservation: 395
+          Cpu: 245
+          MountPoints:
+            - SourceVolume: public
+              ContainerPath: /public
+          Environment:
+            - Name: DJANGO_SETTINGS_MODULE
+              Value: todobackend.settings_release
+            - Name: MYSQL_HOST
+              Value: !Sub ${ApplicationDatabase.Endpoint.Address}
+            - Name: MYSQL_USER
+              Value: todobackend
+            - Name: MYSQL_DATABASE
+              Value: todobackend
+            - Name: SECRETS
+              Value: todobackend/credentials
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Command:
+            - uwsgi
+            - --http=0.0.0.0:8000
+            - --module=todobackend.wsgi
+            - --master
+            - --die-on-term
+            - --processes=4
+            - --threads=2
+            - --check-static=/public
+          PortMappings:
+            - ContainerPort: 8000
+              HostPort: 0
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /${AWS::StackName}/ecs/todobackend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: docker
+        - Name: collectstatic
+          Essential: false
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/docker-in-aws/todobackend:${ApplicationImageTag}
+          MemoryReservation: 5
+          Cpu: 5
+          MountPoints:
+            - SourceVolume: public
+              ContainerPath: /public
+          Environment:
+            - Name: DJANGO_SETTINGS_MODULE
+              Value: todobackend.settings_release
+          Command:
+            - python3
+            - manage.py
+            - collectstatic
+            - --no-input
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /${AWS::StackName}/ecs/todobackend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: docker
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/ecs/todobackend
+      RetentionInDays: 7
+  ApplicationServiceTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Protocol: HTTP
+      Port: 8000
+      VpcId: !Ref VpcId
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 30
+  ApplicationLoadBalancerHttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - TargetGroupArn: !Ref ApplicationServiceTargetGroup
+          Type: forward
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref ApplicationSubnets
+      SecurityGroups:
+        - !Ref ApplicationLoadBalancerSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value : 30
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-alb
+  ApplicationLoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Application Load Balancer Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: 
+            Fn::Sub: ${AWS::StackName}-alb-sg
+  ApplicationLoadBalancerToApplicationIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 60999
+      GroupId: !Ref ApplicationAutoscalingSecurityGroup
+      SourceSecurityGroupId: !Ref ApplicationLoadBalancerSecurityGroup
+  ApplicationLoadBalancerToApplicationEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 32768
+      ToPort: 60999
+      GroupId: !Ref ApplicationLoadBalancerSecurityGroup
+      DestinationSecurityGroupId: !Ref ApplicationAutoscalingSecurityGroup
+  ApplicationDatabase:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: MySQL
+      EngineVersion: 5.7
+      DBInstanceClass: db.t2.micro
+      AllocatedStorage: 10
+      StorageType: gp2
+      MasterUsername: todobackend
+      MasterUserPassword: !Sub ${Secrets.MYSQL_PASSWORD}
+      DBName: todobackend
+      VPCSecurityGroups:
+        - !Ref ApplicationDatabaseSecurityGroup
+      DBSubnetGroupName: !Ref ApplicationDatabaseSubnetGroup
+      MultiAZ: "false"
+      AvailabilityZone: !Sub ${AWS::Region}a
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db
+  ApplicationDatabaseSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Application Database Subnet Group
+      SubnetIds: !Ref ApplicationSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db-subnet-group
+  ApplicationDatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AWS::StackName} Application Database Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 192.0.2.0/32
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-db-sg
+  ApplicationToApplicationDatabaseIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      GroupId: !Ref ApplicationDatabaseSecurityGroup
+      SourceSecurityGroupId: !Ref ApplicationAutoscalingSecurityGroup
+  ApplicationToApplicationDatabaseEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      GroupId: !Ref ApplicationAutoscalingSecurityGroup
+      DestinationSecurityGroupId: !Ref ApplicationDatabaseSecurityGroup
+  ApplicationAutoscalingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AWS::StackName} Application Autoscaling Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  ApplicationAutoscalingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: ApplicationAutoscalingInstanceRole
+  ApplicationAutoscalingInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ECSContainerInstancePermissions
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterContainerInstance
+                  - ecs:DeregisterContainerInstance
+                  - ecs:UpdateContainerInstancesState
+                Resource: !Sub ${ApplicationCluster.Arn}
+              - Effect: Allow
+                Action:
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Submit*
+                  - ecs:Poll
+                  - ecs:StartTelemetrySession
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${AWS::StackName}*
+  ApplicationCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: todobackend-cluster
+  ApplicationAutoscalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            05_public_volume:
+              command: mkdir -p /data/public
+            06_public_volume_permissions:
+              command: chown -R 1000:1000 /data/public
+            10_first_run:
+              command: sh firstrun.sh
+              cwd: /home/ec2-user
+              env:
+                ECS_CLUSTER: !Ref ApplicationCluster
+                STACK_NAME: !Ref AWS::StackName
+                AUTOSCALING_GROUP: ApplicationAutoscaling
+                AWS_DEFAULT_REGION: !Ref AWS::Region
+    Properties:
+      ImageId: !Ref ApplicationImageId
+      InstanceType: t2.micro
+      KeyName: admin
+      IamInstanceProfile: !Ref ApplicationAutoscalingInstanceProfile
+      SecurityGroups:
+        - !Ref ApplicationAutoscalingSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} \
+              --resource ApplicationAutoscalingLaunchConfiguration \
+              --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+              --resource ApplicationAutoscaling \
+              --region ${AWS::Region}
+  ApplicationAutoscaling:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref ApplicationDesiredCount
+        Timeout: PT15M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: !Ref ApplicationDesiredCount
+        MinSuccessfulInstancesPercent: 100
+        WaitOnResourceSignals: "true"
+        PauseTime: PT15M
+    Properties:
+      LaunchConfigurationName: !Ref ApplicationAutoscalingLaunchConfiguration
+      MinSize: 0
+      MaxSize: 4
+      DesiredCapacity: !Ref ApplicationDesiredCount
+      VPCZoneIdentifier: !Ref ApplicationSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ApplicationAutoscaling-instance
+          PropagateAtLaunch: "true"
+
+Outputs:
+  PublicURL:
+    Description: Public DNS name of Application Load Balancer
+    Value: !Sub ${ApplicationLoadBalancer.DNSName}
