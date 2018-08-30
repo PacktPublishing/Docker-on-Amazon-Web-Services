@@ -1,0 +1,161 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: X-Ray Daemon
+
+Resources:
+  ApplicationSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: vpc-f8233a80
+      GroupDescription: !Sub ${AWS::StackName} Application Security Group
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 2000
+          ToPort: 2000
+          CidrIp: 172.31.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ApplicationSecurityGroup
+  ApplicationCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub ${AWS::StackName}-cluster
+  ApplicationService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ApplicationLogGroup
+    Properties:
+      ServiceName: !Sub ${AWS::StackName}-application-service
+      Cluster: !Ref ApplicationCluster
+      TaskDefinition: !Ref ApplicationTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ApplicationSecurityGroup
+          Subnets:
+            - subnet-a5d3ecee
+            - subnet-324e246f
+      DeploymentConfiguration:
+          MinimumHealthyPercent: 100
+          MaximumPercent: 200
+      ServiceRegistries:
+        - RegistryArn: !Sub ${ApplicationServiceDiscoveryService.Arn}
+  ApplicationTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: EcsTaskRole
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                - xray:PutTraceSegments
+                - xray:PutTelemetryRecords
+                Resource: "*"
+  ApplicationTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: EcsTaskExecutionRole
+          PolicyDocument:
+            Statement:
+              - Sid: EcrPermissions
+                Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: CloudwatchLogsPermissions
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub ${ApplicationLogGroup.Arn}
+  ApplicationTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${AWS::StackName}-task-definition
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !Sub ${ApplicationTaskExecutionRole.Arn}
+      TaskRoleArn: !Sub ${ApplicationTaskRole.Arn}
+      Cpu: 256
+      Memory: 512
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+      - Name: xray
+        Image: 385605022855.dkr.ecr.us-east-1.amazonaws.com/docker-in-aws/xray
+        Command:
+          - -o
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Sub /${AWS::StackName}/ecs/xray
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: docker
+        PortMappings:
+          - ContainerPort: 2000
+            Protocol: udp
+        Environment:
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/ecs/xray
+      RetentionInDays: 7
+  ApplicationServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: xray
+      Description: xray service 
+      DnsConfig: 
+        NamespaceId: !Ref ApplicationServiceDiscoveryNamespace
+        DnsRecords:
+          - Type: A
+            TTL: 60
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+  ApplicationServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: services.dockerinaws.org
+      Description: services.dockerinaws.org namespace
+      Vpc: vpc-f8233a80

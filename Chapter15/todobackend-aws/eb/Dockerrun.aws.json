@@ -1,0 +1,71 @@
+{
+  "AWSEBDockerrunVersion": 2,
+  "volumes": [
+    {
+      "name": "public",
+      "host": {"sourcePath": "/tmp/public"}
+    },
+    {
+      "name": "init",
+      "host": {"sourcePath": "/tmp/init"}
+    }
+  ],
+  "containerDefinitions": [
+    {
+      "name": "todobackend",
+      "image": "385605022855.dkr.ecr.us-east-1.amazonaws.com/docker-in-aws/todobackend",
+      "essential": true,
+      "memoryReservation": 395,
+      "mountPoints": [
+        {
+          "sourceVolume": "public",
+          "containerPath": "/public"
+        },
+        {
+          "sourceVolume": "init",
+          "containerPath": "/init"
+        }
+      ],
+      "environment": [
+        {"name":"DJANGO_SETTINGS_MODULE","value":"todobackend.settings_release"}
+      ],
+      "command": [
+        "uwsgi",
+        "--http=0.0.0.0:8000",
+        "--module=todobackend.wsgi",
+        "--master",
+        "--die-on-term",
+        "--processes=4",
+        "--threads=2",
+        "--check-static=/public"
+      ],
+      "portMappings": [
+        {
+          "hostPort": 80,
+          "containerPort": 8000
+        }
+      ]
+    },
+    {
+      "name": "collectstatic",
+      "image": "385605022855.dkr.ecr.us-east-1.amazonaws.com/docker-in-aws/todobackend",
+      "essential": false,
+      "memoryReservation": 5,
+      "mountPoints": [
+        {
+          "sourceVolume": "public",
+          "containerPath": "/public"
+        }
+      ],
+      "environment": [
+        {"name":"DJANGO_SETTINGS_MODULE","value":"todobackend.settings_release"}
+      ],
+      "command": [
+        "python3",
+        "manage.py",
+        "collectstatic",
+        "--no-input"
+      ]
+    }
+  ]
+}
