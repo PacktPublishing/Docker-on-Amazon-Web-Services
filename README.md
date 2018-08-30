@@ -51,6 +51,9 @@ With the following software and hardware list you can run all code files present
 | 1-17       | MacOS Sierra or higher, AWS Account, Docker 17.06 CE or higher, Ansible 2.4 or higher                     | Linux, MacOS, Windows (running Docker in Linux VM) |
 
 
+### Code In Action
+Visit the following link to check out videos of the code being run:
+http://bit.ly/2Noqdpn
 
 We also provide a PDF file that has color images of the screenshots/diagrams used in this book. [Click here to download it](https://www.packtpub.com/sites/default/files/downloads/DockeronAmazonWebServices_ColorImages.pdf).
 
