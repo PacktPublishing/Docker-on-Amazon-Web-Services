@@ -4,7 +4,7 @@
 
 This is the code repository for [Docker on Amazon Web Services](https://ga-dev-tools.appspot.com/campaign-url-builder/?utm_source=github&utm_medium=repository&utm_campaign=9781788626507), published by Packt.
 
-**Build, deploy, and manage your container applications at scale	**
+**Build, deploy, and manage your container applications at scale**
 
 ## What is this book about?
 
