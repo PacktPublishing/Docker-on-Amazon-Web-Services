@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Todobackend Application
+
+Parameters:
+  ApplicationDesiredCount:
+    Type: Number
+    Description: Desired EC2 instance count
+  ApplicationImageId:
+    Type: String
+    Description: ECS Amazon Machine Image (AMI) ID
+  ApplicationSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Target subnets for EC2 instances
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Target VPC
+
+Resources:
+  ApplicationAutoscalingSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${AWS::StackName} Application Autoscaling Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+  ApplicationAutoscalingInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: ApplicationAutoscalingInstanceRole
+  ApplicationAutoscalingInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: ECSContainerInstancePermissions
+          PolicyDocument: 
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterContainerInstance
+                  - ecs:DeregisterContainerInstance
+                  - ecs:UpdateContainerInstancesState
+                Resource: !Sub ${ApplicationCluster.Arn}
+              - Effect: Allow
+                Action:
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Submit*
+                  - ecs:Poll
+                  - ecs:StartTelemetrySession
+                Resource: "*"
+              - Effect: Allow
+                Action: 
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/${AWS::StackName}*
+  ApplicationCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: todobackend-cluster
+  ApplicationAutoscalingLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          commands:
+            05_public_volume:
+              command: mkdir -p /data/public
+            06_public_volume_permissions:
+              command: chown -R 1000:1000 /data/public
+            10_first_run:
+              command: sh firstrun.sh
+              cwd: /home/ec2-user
+              env:
+                ECS_CLUSTER: !Ref ApplicationCluster
+                STACK_NAME: !Ref AWS::StackName
+                AUTOSCALING_GROUP: ApplicationAutoscaling
+                AWS_DEFAULT_REGION: !Ref AWS::Region
+    Properties:
+      ImageId: !Ref ApplicationImageId
+      InstanceType: t2.micro
+      KeyName: admin
+      IamInstanceProfile: !Ref ApplicationAutoscalingInstanceProfile
+      SecurityGroups:
+        - !Ref ApplicationAutoscalingSecurityGroup
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} \
+              --resource ApplicationAutoscalingLaunchConfiguration \
+              --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} \
+              --resource ApplicationAutoscaling \
+              --region ${AWS::Region}
+  ApplicationAutoscaling:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref ApplicationDesiredCount
+        Timeout: PT15M
+    Properties:
+      LaunchConfigurationName: !Ref ApplicationAutoscalingLaunchConfiguration
+      MinSize: 0
+      MaxSize: 4
+      DesiredCapacity: !Ref ApplicationDesiredCount
+      VPCZoneIdentifier: !Ref ApplicationSubnets
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ApplicationAutoscaling-instance
+          PropagateAtLaunch: "true"

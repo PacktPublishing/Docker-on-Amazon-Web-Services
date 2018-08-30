@@ -1,0 +1,76 @@
+{
+  "variables": {
+    "aws_access_key_id": "{{env `AWS_ACCESS_KEY_ID`}}",
+    "aws_secret_access_key": "{{env `AWS_SECRET_ACCESS_KEY`}}",
+    "aws_session_token": "{{env `AWS_SESSION_TOKEN`}}",
+    "timezone": "US/Eastern"
+  },
+  "builders": [
+    {
+      "type": "amazon-ebs",
+      "access_key": "{{user `aws_access_key_id`}}",
+      "secret_key": "{{user `aws_secret_access_key`}}",
+      "token": "{{user `aws_session_token`}}",
+      "region": "us-east-1",
+      "source_ami": "ami-5253c32d",
+      "instance_type": "t2.micro",
+      "ssh_username": "ec2-user",
+      "associate_public_ip_address": "true",
+      "ami_name": "docker-in-aws-ecs {{timestamp}}",
+      "launch_block_device_mappings": [
+        {
+          "device_name": "/dev/xvdcy",
+          "volume_size": 20,
+          "volume_type": "gp2",
+          "delete_on_termination": true
+        }
+      ],
+      "tags": {
+        "Name": "Docker in AWS ECS Base Image 2018.03.a",
+        "SourceAMI": "{{ .SourceAMI }}",
+        "DockerVersion": "17.12.1-ce",
+        "ECSAgentVersion": "1.18.0"
+      }
+    }
+  ],
+  "provisioners": [
+    {
+      "type": "shell",
+      "script": "scripts/storage.sh"
+    },
+    {
+      "type": "shell",
+      "script": "scripts/time.sh",
+      "environment_vars": [
+        "TIMEZONE={{user `timezone`}}"
+      ]
+    },
+    {
+      "type": "shell",
+      "script": "scripts/cloudinit.sh"
+    },
+    {
+      "type": "shell",
+      "inline": [
+        "sudo yum -y -x docker\\* -x ecs\\* update",
+        "sudo yum -y install aws-cfn-bootstrap awslogs jq"
+      ] 
+    },
+    {
+      "type": "shell",
+      "script": "scripts/cleanup.sh"
+    },
+    {
+      "type": "file",
+      "source": "files/firstrun.sh",
+      "destination": "/home/ec2-user/firstrun.sh"
+    }
+  ],
+  "post-processors": [
+    {
+      "type": "manifest",
+      "output": "manifest.json",
+      "strip_path": true
+    }
+  ]
+}
