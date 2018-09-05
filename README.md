@@ -2,7 +2,7 @@
 
 <a href="https://ga-dev-tools.appspot.com/campaign-url-builder/?utm_source=github&utm_medium=repository&utm_campaign=9781788626507"><img src="https://d255esdrn735hr.cloudfront.net/sites/default/files/imagecache/ppv4_main_book_cover/B09350.png" alt="Docker on Amazon Web Services" height="256px" align="right"></a>
 
-This is the code repository for [Docker on Amazon Web Services](https://github.com/PacktPublishing/Docker-on-Amazon-Web-Services), published by Packt.
+This is the code repository for [Docker on Amazon Web Services](https://ga-dev-tools.appspot.com/campaign-url-builder/?utm_source=github&utm_medium=repository&utm_campaign=9781788626507), published by Packt.
 
 **Build, deploy, and manage your container applications at scale**
 
