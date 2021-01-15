@@ -1,8 +1,3 @@
-## $5 Tech Unlocked 2021!
-[Buy and download this Book for only $5 on PacktPub.com](https://www.packtpub.com/product/docker-on-amazon-web-services/9781788626507)
------
-*If you have read this book, please leave a review on [Amazon.com](https://www.amazon.com/gp/product/1788626508).     Potential readers can then use your unbiased opinion to help them make purchase decisions. Thank you. The $5 campaign         runs from __December 15th 2020__ to __January 13th 2021.__*
-
 # Docker on Amazon Web Services
 
 <a href="https://ga-dev-tools.appspot.com/campaign-url-builder/?utm_source=github&utm_medium=repository&utm_campaign=9781788626507"><img src="https://d255esdrn735hr.cloudfront.net/sites/default/files/imagecache/ppv4_main_book_cover/B09350.png" alt="Docker on Amazon Web Services" height="256px" align="right"></a>
