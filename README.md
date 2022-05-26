@@ -1,3 +1,7 @@
+## [Get this title for $10 on Packt's Spring Sale](https://www.packt.com/B09350?utm_source=github&utm_medium=packt-github-repo&utm_campaign=spring_10_dollar_2022)
+-----
+For a limited period, all eBooks and Videos are only $10. All the practical content you need \- by developers, for developers
+
 # Docker on Amazon Web Services
 
 <a href="https://ga-dev-tools.appspot.com/campaign-url-builder/?utm_source=github&utm_medium=repository&utm_campaign=9781788626507"><img src="https://d255esdrn735hr.cloudfront.net/sites/default/files/imagecache/ppv4_main_book_cover/B09350.png" alt="Docker on Amazon Web Services" height="256px" align="right"></a>
